@@ -4,10 +4,43 @@ This command only records/renders. It never uploads or publishes.
 """
 import argparse, glob, json, math, os, re, shutil, subprocess, sys, time
 from datetime import datetime
+import site
+from pathlib import Path
+
+# Keep NVIDIA CUDA DLL directories available to CTranslate2 on Windows.
+_CUDA_DLL_HANDLES = []
+
+
+if os.name == "nt":
+    
+
+    nvidia_dir = Path(site.getsitepackages()[-1]) / "nvidia"
+    
+    cuda_dll_paths = []
+
+    if nvidia_dir.exists():
+        for dll_dir in nvidia_dir.glob("*/bin"):
+            if dll_dir.is_dir():
+                dll_path = str(dll_dir)
+
+                _CUDA_DLL_HANDLES.append(
+                    os.add_dll_directory(dll_path)
+                )
+
+                cuda_dll_paths.append(dll_path)
+
+        os.environ["PATH"] = (
+            os.pathsep.join(cuda_dll_paths)
+            + os.pathsep
+            + os.environ.get("PATH", "")
+        )
+
+
 import numpy as np
 from live_chat import create_live_chat_collector, score_chat_windows, summarize_chat_window
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+
 OUTPUT_DIR = os.path.join(HERE, "output")
 TEST_OUT = os.path.join(HERE, "test_out")
 WORK = os.path.join(HERE, "work")
@@ -64,7 +97,7 @@ def start_recorder(url, file_, chunk, max_seconds, outdir):
     if file_:
         inputs = ["-i", file_]
     else:
-        r = run(ytdlp_cmd("-g", "--no-warnings", "-f", "bv[height<=1920]+ba/b[height<=1920]/b", url))
+        r = run(ytdlp_cmd("-g", "--no-warnings", "-f", "bv[height<=1080]+ba/b[height<=1080]/b", url))
         lines = [l for l in r.stdout.splitlines() if l.startswith("http")]
         if r.returncode or not lines:
             sys.exit("could not get a stream URL:\n" + r.stderr[-400:])
@@ -79,6 +112,7 @@ def start_recorder(url, file_, chunk, max_seconds, outdir):
 
 # ---------- analysis ----------
 _model = None
+_video_encoder = None
 
 
 class WordTimings(list):
@@ -172,14 +206,34 @@ def locked_language():
         return "hi"
     return None
 
+def get_whisper_device():
+    try:
+        import ctranslate2
+
+        if ctranslate2.get_cuda_device_count() > 0:
+            print("Whisper device: NVIDIA GPU (CUDA)")
+            return "cuda", "float16"
+
+    except (ImportError, RuntimeError, OSError) as e:
+        print(f"CUDA detection unavailable: {e}")
+
+    print("Whisper device: CPU")
+    return "cpu", "int8"
+
 
 def whisper_words(audio):
     global _model
     from faster_whisper import WhisperModel
     if _model is None:
-        _model = WhisperModel("base", device="cuda", compute_type="float16")
+        device, compute_type = get_whisper_device()
+        _model = WhisperModel(
+            "base",
+            device=device,
+            compute_type=compute_type
+        )
     lock = locked_language()
     segments, info = _model.transcribe(audio, word_timestamps=True, vad_filter=True, task="transcribe", language=lock)
+    
     segments = list(segments)
     spoken_language = info.language or "unknown"
     if lock is None and (getattr(info, "language_probability", 0) or 0) >= 0.6:
@@ -574,24 +628,109 @@ def build_video_filter(ass_name, crop=False, crop_offset=0.5, source_roi=None, l
             "crop=1080:1920,boxblur=30:5[bg];[b]scale=1080:-2[fg];"
             "[bg][fg]overlay=(W-w)/2:(H-h)/2,setpts=PTS-STARTPTS,ass=" + ass_name)
 
+def get_video_encoder():
+    global _video_encoder
+
+    if _video_encoder is not None:
+        return _video_encoder
+
+    result = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-encoders"],
+        capture_output=True,
+        text=True
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(f"FFmpeg encoder detection failed: {result.stderr[-500:]}")
+
+    if "h264_nvenc" in result.stdout:
+        _video_encoder = "h264_nvenc"
+        print("Video encoder: NVIDIA NVENC")
+    else:
+        _video_encoder = "libx264"
+        print("Video encoder: CPU (libx264)")
+
+    return _video_encoder
+
 
 def cut(chunk_path, words, start, length, out_mp4, credit, crop=False, crop_offset=0.5,
         source_roi=None, caption_margin_v=400, layout="fit", pan_keys=None):
+    
+    global _video_encoder
     d = os.path.dirname(out_mp4)
     ass_name = "cap_" + os.path.basename(out_mp4) + ".ass"
+
     write_ass(os.path.join(d, ass_name), words, start, length, credit, caption_margin_v)
-    fg = build_video_filter(ass_name, crop=crop, crop_offset=crop_offset, source_roi=source_roi, layout=layout,
-                            pan_keys=pan_keys)
-    r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{start:.2f}",
-                        "-i", os.path.abspath(chunk_path), "-t", f"{length}",
-                        "-filter_complex", fg, "-af", "asetpts=PTS-STARTPTS",
-                        "-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", "20",
-                        "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart",
-                        os.path.basename(out_mp4)], cwd=d, capture_output=True, text=True)
+
+    fg = build_video_filter(
+        ass_name,
+        crop=crop,
+        crop_offset=crop_offset,
+        source_roi=source_roi,
+        layout=layout,
+        pan_keys=pan_keys
+    )
+
+    
+
+    encoder = get_video_encoder()
+
+    def run_ffmpeg(selected_encoder):
+        if selected_encoder == "h264_nvenc":
+            encoder_args = [
+                "-c:v", "h264_nvenc",
+                "-preset", "p5",
+                "-rc", "vbr",
+                "-cq", "20"
+            ]
+        else:
+            encoder_args = [
+                "-c:v", "libx264",
+                "-preset", "medium",
+                "-crf", "20"
+            ]
+
+        command = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-ss", f"{start:.2f}",
+            "-i", os.path.abspath(chunk_path),
+            "-t", f"{length}",
+            "-filter_complex", fg,
+            "-af", "asetpts=PTS-STARTPTS"
+        ] + encoder_args + [
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac",
+            "-b:a", "128k",
+            "-movflags", "+faststart",
+            os.path.basename(out_mp4)
+        ]
+
+        return subprocess.run(
+            command,
+            cwd=d,
+            capture_output=True,
+            text=True
+        )
+
+    r = run_ffmpeg(encoder)
+    nvenc_error = None
+
+    if r.returncode != 0 and encoder == "h264_nvenc":
+        nvenc_error = r.stderr[-500:]
+        print("NVENC encoding failed. Retrying with CPU encoder (libx264)...")
+
+        _video_encoder = "libx264"
+        r = run_ffmpeg("libx264")
+
+
     os.remove(os.path.join(d, ass_name))
+
     if r.returncode:
+        if nvenc_error:
+            print("NVENC error:", nvenc_error)
         print("ffmpeg cut failed:", r.stderr[-300:])
         return False
+
     return True
 
 
